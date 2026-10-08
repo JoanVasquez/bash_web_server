@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+
+PORT=8080
+ADDRESS='0.0.0.0'
+
+fatal() {
+    echo '[fatal]' "$@" >&2
+    exit 1
+}
+
+parse-request() {
+    declare -gA REQ_INFO=()
+    declare -gA REQ_HEADERS=()
+
+    local state='status'
+    local line
+
+    while read -r line; do
+        line=${line%$'\r'}
+        echo "processing line:  $line"
+
+        case "$state" in
+        'status')
+            # parse the status line
+            # "GET /foo.txt HTTP/1.1"
+            local method path version
+            read -r method path version <<<"$line"
+            REQ_INFO[method]=$method
+            REQ_INFO[path]=$path
+            REQ_INFO[version]=$version
+            state='headers'
+            ;;
+        'headers')
+            # parse the headers
+            if [[ -z $line ]]; then
+                # XXX this doesn't support body parsin
+                break
+            fi
+            local key value
+            IFS=: read -r key value <<<"$line"
+            key=${key,,}
+            value=${value# *}
+            REQ_HEADERS[$key]=$value
+            ;;
+        'body')
+            fatal 'body parsing not supported'
+            ;;
+        esac
+    done
+}
+
+main() {
+    enable accept || fatal 'failed to load accept'
+
+    echo "listening of http://$ADDRESS:$PORT"
+
+    local fd ip
+    accept -b "$ADDRESS" -v fd -r ip "$PORT"
+
+    local line
+    while read -r -u "$fd" line; do
+        line=${line%$'\r'}
+        echo "got data: $line"
+
+        # we're done processing headers
+        if [[ -z $line ]]; then
+            break
+        fi
+    done
+
+    # if we are here, we should reply to the caller
+    printf 'HTTP/1.1 200 OK\r\n' >&"$fd"
+    printf 'Content-Type: text/plain\r\n' >&"$fd"
+    printf '\r\n' >&"$fd"
+    cat file.txt >&"$fd" # send content of file.txt to client
+    # printf 'hello world\n' >&"$fd"
+
+    exec {fd}>&-
+}
+
+main "$@"
