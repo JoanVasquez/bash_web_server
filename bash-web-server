@@ -2,10 +2,109 @@
 
 PORT=8080
 ADDRESS='0.0.0.0'
+DIR='.'
 
 fatal() {
     echo '[fatal]' "$@" >&2
     exit 1
+}
+
+mime-type() {
+    local f=$1
+    local bname=${f##*/}
+    local ext=${bname##.}
+
+    [[ $bname == "$ext" ]] && ext=
+
+    case "$ext" in
+    html | htm) echo 'text/html' ;;
+    jpge | jpg) echo 'image/jpeg' ;;
+    png) echo 'image/png' ;;
+    txt) echo 'text/plain' ;;
+    css) echo 'text/css' ;;
+    js) echo 'text/javascript' ;;
+    json) echo 'application/json' ;;
+    *) echo 'application/octet-stream' ;;
+    esac
+}
+
+html-encode() {
+    local s=$1
+
+    s=${s//&/\&amp;}
+    s=${s//</\&lt;}
+    s=${s//>/\&gt;}
+    s=${s//\"/\&quot;}
+    s=${s//\'/\&apos;}
+
+    echo "$s"
+}
+
+list-directory() {
+    local d=$1
+
+    shopt -s nullglob dotglob
+    echo '<h1>Directory Listings</h1>'
+    echo "<h2>Directory: $(html-encode "$d")</h2>"
+    echo '<hr>'
+    echo '<ul>'
+    for f in .. "$d"/*; do
+        f=${f##*/}
+        printf '<li><a href="%s">%s</a></li>\n' \
+            "$(urlencode "$f")" \
+            "$(html-encode "$f")"
+    done
+    echo '</ul>'
+    echo '<hr>'
+}
+
+urlencode() {
+    # Usage: urlencode "string"
+    local LC_ALL=C
+    for ((i = 0; i < ${#1}; i++)); do
+        : "${1:i:1}"
+        case "$_" in
+        [a-zA-Z0-9.~_-])
+            printf '%s' "$_"
+            ;;
+
+        *)
+            printf '%%%02X' "'$_"
+            ;;
+        esac
+    done
+    printf '\n'
+}
+
+urldecode() {
+    # Usage: urldecode "string"
+    : "${1//+/ }"
+    printf '%b\n' "${_//%/\\x}"
+}
+
+normalize-path() {
+    local path=/$1
+
+    local parts
+    IFS='/' read -r -a parts <<<"$path"
+
+    local -a out=()
+    local part
+    for part in "${parts[@]}"; do
+        case "$part" in
+        '') ;;  # ignore empty directories (multiple /)
+        '.') ;; # ignore current directory
+        '..') unset 'out[-1]' 2>/dev/null ;;
+        *) out+=("$part") ;;
+        esac
+    done
+
+    local s
+    s=$(
+        IFS=/
+        echo "${out[*]}"
+    )
+    echo "/$s"
 }
 
 parse-request() {
@@ -17,7 +116,7 @@ parse-request() {
 
     while read -r line; do
         line=${line%$'\r'}
-        echo "processing line:  $line"
+        # echo "processing line:  $line"
 
         case "$state" in
         'status')
@@ -49,33 +148,99 @@ parse-request() {
     done
 }
 
-main() {
-    enable accept || fatal 'failed to load accept'
+process-request() {
+    local fd=$1
 
-    echo "listening of http://$ADDRESS:$PORT"
+    parse-request <&"$fd"
 
-    local fd ip
-    accept -b "$ADDRESS" -v fd -r ip "$PORT"
+    # validate the request
+    [[ ${REQ_INFO[version]} == 'HTTP/1.1' ]] || fatal 'unsupported HTTP version'
+    [[ ${REQ_INFO[method]} == 'GET' ]] || fatal 'unsupported HTTP method'
+    [[ ${REQ_INFO[path]} == /* ]] || fatal 'path must be absolute'
 
-    local line
-    while read -r -u "$fd" line; do
-        line=${line%$'\r'}
-        echo "got data: $line"
+    echo "${REQ_INFO[method]} ${REQ_INFO[path]}"
 
-        # we're done processing headers
-        if [[ -z $line ]]; then
+    # if we are here, we should reply to the caller
+    # "/././foo%20bar.txt?query=whatever"
+    local path="${REQ_INFO[path]}"
+
+    # "/./foo%20bar.txt?query=whatever"
+    path=${path:1}
+
+    # "/./foo%20bar.txt"
+    local query
+    IFS='?' read -r path query <<<"$path"
+
+    # "././foo bar.txt"
+    path=$(urldecode "$path")
+    # "foo bar.txt"
+    path=$(normalize-path "$path")
+
+    # "foo bar.txt"
+    path=${path:1}
+
+    path=${path:-.}
+
+    local totry=(
+        "$path"
+        "$path/index.html"
+        "$path/index.htm"
+    )
+
+    local try file
+    for try in "${totry[@]}"; do
+        if [[ -f $try ]]; then
+            file=$try
             break
         fi
     done
 
-    # if we are here, we should reply to the caller
-    printf 'HTTP/1.1 200 OK\r\n' >&"$fd"
-    printf 'Content-Type: text/plain\r\n' >&"$fd"
-    printf '\r\n' >&"$fd"
-    cat file.txt >&"$fd" # send content of file.txt to client
-    # printf 'hello world\n' >&"$fd"
+    if [[ -n $file ]]; then
+        # a static file was found
+        local mine
+        mine=$(mime-type "$file")
+        printf 'HTTP/1.1 200 OK\r\n' >&"$fd"
+        printf 'Content-Type: %s\r\n' "$mime" >&"$fd"
+        printf '\r\n' >&"$fd"
+        cat "$file" >&"$fd" # send content of file.txt to client
+        # printf 'hello world\n' >&"$fd"
+    elif [[ -d $path ]]; then
+        # try a directory
+        printf 'HTTP/1.1 200 OK\r\n' >&"$fd"
+        printf 'Content-Type: text/html\r\n' >&"$fd"
+        printf '\r\n' >&"$fd"
+        list-directory "$path" >&"$fd"
+    else
+        # nothing was found
+        printf 'HTTP/1.1 404 Not Found\r\n' >&"$fd"
+        printf '\r\n' >&"$fd"
+    fi
+}
 
-    exec {fd}>&-
+main() {
+    enable accept || fatal 'failed to load accept'
+
+    local OPTIND OPTARG opt
+    while getopts 'b:p:d:' opt; do
+        case "$opt" in
+        b) ADDRESS=$OPTARG ;;
+        p) PORT=$OPTARG ;;
+        d) DIR=$OPTARG ;;
+        *) fatal "bad option" ;;
+        esac
+    done
+
+    cd "$DIR" || fatal "failed to move to $DIR"
+
+    echo "listening of http://$ADDRESS:$PORT"
+    echo "serving out of $DIR"
+
+    local fd ip
+    while true; do
+        accept -b "$ADDRESS" -v fd -r ip "$PORT" || fatal 'failed to read socket'
+        process-request "$fd" &
+        exec {fd}>&-
+    done
 }
 
 main "$@"
